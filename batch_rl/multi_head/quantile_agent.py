@@ -142,9 +142,9 @@ class QuantileAgent(rainbow_agent.RainbowAgent):
     gamma_with_terminal = self.cumulative_gamma * is_terminal_multiplier
     gamma_with_terminal = gamma_with_terminal[:, None]
 
-    # size of next_qt_argmax: 1 x batch_size
+    # size of next_qt_argmax: batch_size * 1
     next_qt_argmax = tf.argmax(
-        self._replay_next_target_net_outputs.q_values, axis=1)[:, None]
+        self._replay_next_target_net_outputs.q_values, axis=1)[:, None]  # @Yi, to get the a = argmax Q = argmax E[Z]; q_values is the mean of logits over atoms
     batch_indices = tf.range(tf.to_int64(batch_size))[:, None]
     # size of next_qt_argmax: batch_size x 2
     batch_indexed_next_qt_argmax = tf.concat(
@@ -152,8 +152,8 @@ class QuantileAgent(rainbow_agent.RainbowAgent):
     # size of next_logits (next quantiles): batch_size x num_atoms
     next_logits = tf.gather_nd(
         self._replay_next_target_net_outputs.logits,
-        batch_indexed_next_qt_argmax)
-    return rewards + gamma_with_terminal * next_logits
+        batch_indexed_next_qt_argmax)  # @Yi gather max Q, where Q = E[Z]
+    return rewards + gamma_with_terminal * next_logits  # the traget = r + \gamma* max_Q
 
   def _build_train_op(self):
     """Builds a training op.
@@ -161,7 +161,7 @@ class QuantileAgent(rainbow_agent.RainbowAgent):
     Returns:
       train_op: An op performing one step of training.
     """
-    target_distribution = tf.stop_gradient(self._build_target_distribution())
+    target_distribution = tf.stop_gradient(self._build_target_distribution()) # shape [batch, num_atoms]
 
     # size of indices: batch_size x 1.
     indices = tf.range(tf.shape(self._replay_net_outputs.logits)[0])[:, None]
@@ -169,7 +169,7 @@ class QuantileAgent(rainbow_agent.RainbowAgent):
     reshaped_actions = tf.concat([indices, self._replay.actions[:, None]], 1)
     # For each element of the batch, fetch the logits for its selected action.
     chosen_action_logits = tf.gather_nd(self._replay_net_outputs.logits,
-                                        reshaped_actions)
+                                        reshaped_actions)  # @Yi sampled Z(s, a), Z is the dist of Q, represented by its quantile
 
     bellman_errors = (target_distribution[:, None, :] -
                       chosen_action_logits[:, :, None])  # Input `u' of Eq. 9.

@@ -28,7 +28,9 @@ MultiNetworkNetworkType = collections.namedtuple(
     ['q_networks', 'unordered_q_networks', 'q_values'])
 QuantileNetworkType = collections.namedtuple(
     'qr_dqn_network', ['q_values', 'logits', 'probabilities'])
-
+MultiQuantileNetworkType = collections.namedtuple(
+    'multi_qr_dqn_network',
+    ['qr_dqn_newtorks', 'unordered_qr_dqn_networks', 'q_values', 'unordered_logits', 'unordered_probs'])
 
 class QuantileNetwork(tf.keras.Model):
   """Keras network for QR-DQN agent.
@@ -102,8 +104,8 @@ class QuantileNetwork(tf.keras.Model):
     net = self.dense1(net)
     net = self.dense2(net)
     logits = tf.reshape(net, [-1, self.num_actions, self.num_atoms])
-    probabilities = tf.keras.activations.softmax(tf.zeros_like(logits))
-    q_values = tf.reduce_mean(logits, axis=2)
+    probabilities = tf.keras.activations.softmax(tf.zeros_like(logits))  # TODO: the default axis=-1, check it  # TODO: what is this probability used for : uniform prob?
+    q_values = tf.reduce_mean(logits, axis=2)  # TODO: QR-DQN calculate q-value using mean, can we use weighted mean where weights are given according to the epi uncertainty
     return QuantileNetworkType(q_values, logits, probabilities)
 
 
@@ -213,7 +215,7 @@ def combine_q_functions(q_functions, transform_strategy, **kwargs):
   """Utility function for combining multiple Q functions.
 
   Args:
-    q_functions: Multiple Q-functions concatenated.
+    q_functions: Multiple Q-functions concatenated. shape: [batch, num_act, num_net]
     transform_strategy: str, Possible options include (1) 'IDENTITY' for no
       transformation (2) 'STOCHASTIC' for random convex combination.
     **kwargs: Arbitrary keyword arguments. Used for passing `transform_matrix`,
@@ -225,7 +227,7 @@ def combine_q_functions(q_functions, transform_strategy, **kwargs):
     q_values: Q-values based on combining the multiple heads.
   """
   # Create q_values before reordering the heads for training
-  q_values = tf.reduce_mean(q_functions, axis=-1)
+  q_values = tf.reduce_mean(q_functions, axis=-1) # @ Yi, q_value is the mean over ensembles, shape [batch, num_actions]
 
   if transform_strategy == 'STOCHASTIC':
     left_stochastic_matrix = kwargs.get('transform_matrix')
@@ -372,11 +374,82 @@ class MulitNetworkQNetwork(tf.keras.Model):
     """
     unordered_q_networks = [
         network(state).q_values for network in self._q_networks]
-    unordered_q_networks = tf.stack(unordered_q_networks, axis=-1)
+    unordered_q_networks = tf.stack(unordered_q_networks, axis=-1)  # shape: [batch_size, num_action, num_nets]
     q_networks, q_values = combine_q_functions(unordered_q_networks,
                                                self._transform_strategy,
                                                **self._kwargs)
+
     return MultiNetworkNetworkType(q_networks, unordered_q_networks, q_values)
+
+
+class MultiQuantileNetwork(tf.keras.Model):
+  """Multiple convolutional networks to compute Q-distribution estimates.
+
+  Attributes:
+    num_actions: An inteer representing the number of actions.
+    num_networks: An integer representing the number of Q-networks.
+  """
+
+  def __init__(self,
+               num_actions: int,
+               num_atoms: int,
+               num_networks: int,
+               transform_strategy: str = None,
+               name: str = None,
+               **kwargs):
+    """Creates the networks used calculating multiple Q-values.
+
+    Args:
+      num_actions: number of actions.
+      num_atoms: An integer representing the number of quantiles of the value
+      function distribution.
+      num_networks: number of separate Q-networks.
+      transform_strategy: Possible options include (1) 'IDENTITY' for no
+        transformation (Ensemble-DQN) (2) 'STOCHASTIC' for random convex
+        combination (REM).
+      name: used to create scope for network parameters.
+      **kwargs: Arbitrary keyword arguments. Used for passing
+        `transform_matrix`, the matrix for transforming the Q-values if only
+        the passed `transform_strategy` is `STOCHASTIC`.
+    """
+
+    super(MulitQuantileNetwork, self).__init__(name=name)
+    self.num_actions = num_actions
+    self.num_atoms = num_atoms
+    self.num_networks = num_networks
+    self._transform_strategy = transform_strategy
+    self._kwargs = kwargs
+    self._device_fn = kwargs.pop('device_fn', lambda i: '/gpu:0')
+
+    # Create multiple Quantile-networks
+    self._q_networks = []
+    for i in range(self.num_networks):
+      with tf.device(self._device_fn(i)):
+        q_net = QuantileNetwork(num_actions, num_atoms, name='subnet_{}'.format(i))
+      self._q_networks.append(q_net)
+
+  def call(self, state):
+    """Creates the output tensor/op given the input state tensor.
+
+    See https://www.tensorflow.org/api_docs/python/tf/keras/Model for more
+    information on this. Note that tf.keras.Model implements `call` which is
+    wrapped by `__call__` function by tf.keras.Model.
+
+    Args:
+      state: Tensor, input tensor.
+    Returns:
+      collections.namedtuple, output ops (graph mode) or output tensors (eager).
+    """
+    unordered_q_networks = [
+        network(state).q_values for network in self._q_networks]
+    unordered_q_networks = tf.stack(unordered_q_networks, axis=-1)  # @Yi shape: [batch, num_action, num_network]
+    q_networks, q_values = combine_q_functions(unordered_q_networks,
+                                               self._transform_strategy,
+                                               **self._kwargs)
+    # TODO: handle the logits and probs, --> first figure out its usage
+    unordered_qr_logits = []
+    unordered_qr_probs = []
+    return MultiNetworkNetworkType(q_networks, unordered_q_networks, q_values, undered_qr_logits, unordered_qr_probs)
 
 
 def random_stochastic_matrix(dim, num_cols=None, dtype=tf.float32):
@@ -385,3 +458,4 @@ def random_stochastic_matrix(dim, num_cols=None, dtype=tf.float32):
   mat = tf.random.uniform(shape=mat_shape, dtype=dtype)
   mat /= tf.norm(mat, ord=1, axis=0, keepdims=True)
   return mat
+

@@ -14,33 +14,52 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Multi Q-Network DQN agent."""
+"""Multi Q-Network QR-DQN agent."""
 
 import copy
 import os
 
 from batch_rl.multi_head import atari_helpers
 from dopamine.agents.dqn import dqn_agent
+from dopamine.agent.rainbow import rainbow_agents
 import gin
 import tensorflow.compat.v1 as tf
 
 
 @gin.configurable
-class MultiNetworkDQNAgent(dqn_agent.DQNAgent):
+class MultiQuantileAgent(rainbow_agent.RainbowAgent):
   """DQN agent with multiple heads."""
 
   def __init__(self,
                sess,
                num_actions,
+               kappa=1.0,
+               network=atari_helpers.MulitQuantileNetwork,
                num_networks=1,
+               num_atoms=200,
+               gamma=0.99,
+               update_horizon=1,
+               min_replay_history=50000,
+               update_period=4,
+               target_upadte_period=10000,
+               epsilon_fn=dqn_agent.linear_decaying_epsilon,
+               epsilon_train=0.1,
+               epsilon_eval=0.05,
+               epsilon_decay_period=1e6,
+               replay_scheme='prioritized',
+               tf_device='/cpu:0',
+               optimizer=tf.train.AdamOptimizer(
+                   learning_rate=0.00005, epsilon=0.0003125),
+               summary_writer=None,
+               summary_writing_fequency=500,
+
                transform_strategy='IDENTITY',
                num_convex_combinations=1,
-               network=atari_helpers.MulitNetworkQNetwork,
                init_checkpoint_dir=None,
-               use_deep_exploration=False, # TODO: @Yi what?
+               use_deep_exploration=False,
                **kwargs):
     """Initializes the agent and constructs the components of its graph.
-
+    TODO: fill these
     Args:
       sess: tf.Session, for executing ops.
       num_actions: int, number of actions the agent can take at any state.
@@ -68,7 +87,10 @@ class MultiNetworkDQNAgent(dqn_agent.DQNAgent):
     tf.logging.info('\t num_convex_combinations: %d', num_convex_combinations)
     tf.logging.info('\t init_checkpoint_dir: %s', init_checkpoint_dir)
     tf.logging.info('\t use_deep_exploration %s', use_deep_exploration)
+    
+    self.kappa = kappa
     self.num_networks = num_networks
+    self.num_atoms = num_atoms
     if init_checkpoint_dir is not None:
       self._init_checkpoint_dir = os.path.join(init_checkpoint_dir,
                                                'checkpoints')
@@ -80,8 +102,27 @@ class MultiNetworkDQNAgent(dqn_agent.DQNAgent):
     self._num_convex_combinations = num_convex_combinations
     self.transform_strategy = transform_strategy
     self.use_deep_exploration = use_deep_exploration
-    super(MultiNetworkDQNAgent, self).__init__(
-        sess, num_actions, network=network, **kwargs)
+
+    super(MultiQuantileAgent, self).__init__(
+        sess=sess,
+        num_actions=num_actions,
+        network=network,
+        num_atoms=num_atoms,
+        gamma=gamma,
+        update_horizon=update_horizon,
+        min_replay_history=min_replay_history,
+        update_period=update_period,
+        target_update_period=target_update_period,
+        epsilon_fn=epsilon_fn,
+        epsilon_train=epsilon_train,
+        epsilon_eval=epsilon_eval,
+        epsilon_decay_period=epsilon_decay_period,
+        replay_scheme=replay_scheme,
+        tf_device=tf_device,
+        optimizer=optimizer,
+        summary_writer=summary_writer,
+        summary_writing_frequency=summary_writing_frequency)
+
 
   def _create_network(self, name):
     """Builds a multi-network Q-network that outputs Q-values for each network.
@@ -95,6 +136,8 @@ class MultiNetworkDQNAgent(dqn_agent.DQNAgent):
     """
     # Pass the device_fn to place Q-networks on different devices
     kwargs = {'device_fn': lambda i: '/gpu:{}'.format(i // 4)}
+
+    # TODO: Decide the transorm_matrix
     if self._q_networks_transform is None:
       if self.transform_strategy == 'STOCHASTIC':
         tf.logging.info('Creating q_networks transformation matrix..')
@@ -102,12 +145,14 @@ class MultiNetworkDQNAgent(dqn_agent.DQNAgent):
             self.num_networks, num_cols=self._num_convex_combinations)
     if self._q_networks_transform is not None:
       kwargs.update({'transform_matrix': self._q_networks_transform})
+    
     return self.network(
         num_actions=self.num_actions,
+        num_atoms=self.num_atoms,
         num_networks=self.num_networks,
         transform_strategy=self.transform_strategy,
         name=name,
-        **kwargs)  # kwargsö {'device_fn', 'transform_matrix'}
+        **kwargs)
 
   def _build_target_q_op(self):
     """Build an op used as a target for the Q-value.
@@ -117,12 +162,40 @@ class MultiNetworkDQNAgent(dqn_agent.DQNAgent):
     """
     # Get the maximum Q-value across the actions dimension for each head.
     replay_next_qt_max = tf.reduce_max(
-        self._replay_next_target_net_outputs.q_networks, axis=1)  # q_networks.shape=[batch, num_act, num_net]
+        self._replay_next_target_net_outputs.q_networks, axis=1)
     is_non_terminal = 1. - tf.cast(self._replay.terminals, tf.float32)
     is_non_terminal = tf.expand_dims(is_non_terminal, axis=-1)
     rewards = tf.expand_dims(self._replay.rewards, axis=-1)
     return rewards + (
-        self.cumulative_gamma * replay_next_qt_max * is_non_terminal)  # @Yi, targets for each network
+        self.cumulative_gamma * replay_next_qt_max * is_non_terminal)
+
+  def _build_target_distribution(self):
+    # TODO: calculate the target Q distribution
+    batch_size = tf.shape(self._replay.rewards)[0]
+    # size of rewards: batch_size x 1
+    rewards = self._replay.rewards[:, None]
+    # size of tiled_support: batch_size x num_atoms
+
+    is_terminal_multiplier = 1. - tf.cast(self._replay.terminals, tf.float32)
+    # Incorporate terminal state to discount factor.
+    # size of gamma_with_terminal: batch_size x 1
+    gamma_with_terminal = self.cumulative_gamma * is_terminal_multiplier
+    gamma_with_terminal = gamma_with_terminal[:, None]
+
+    # TODO: calculate the q_values
+    # size of next_qt_argmax: batch_size * 1
+    next_qt_argmax = tf.argmax(
+        self._replay_next_target_net_outputs.q_values, axis=1)[:, None]  # @Yi, to get the a = argmax Q = argmax E[Z]; q_values is the mean of logits over atoms
+    batch_indices = tf.range(tf.to_int64(batch_size))[:, None]
+    # size of next_qt_argmax: batch_size x 2
+    batch_indexed_next_qt_argmax = tf.concat(
+        [batch_indices, next_qt_argmax], axis=1)
+    # size of next_logits (next quantiles): batch_size x num_atoms
+    next_logits = tf.gather_nd(
+        self._replay_next_target_net_outputs.logits,
+        batch_indexed_next_qt_argmax)  # @Yi gather max Q, where Q = E[Z]
+    return rewards + gamma_with_terminal * next_logits  # the traget = r + \gamma* max_Q
+
 
   def begin_episode(self, observation):
     """Returns the agent's first action for this episode.
@@ -138,13 +211,13 @@ class MultiNetworkDQNAgent(dqn_agent.DQNAgent):
       # collection each episode for online experiments, similar to deep
       # exploration strategy proposed by Bootstrapped DQN
       self._sess.run(self._update_episode_q_function)
-    return super(MultiNetworkDQNAgent, self).begin_episode(observation)
+    return super(MultiQuantileAgent, self).begin_episode(observation)
 
   def _build_networks(self):
-    """ build _q_argmax_train, _q_argmax_eval"""
+    # TODO: build network
     super(MultiNetworkDQNAgent, self)._build_networks()
     # q_argmax is only used for picking an action
-    self._q_argmax_eval = tf.argmax(self._net_outputs.q_values, axis=1)[0]  # @Yi, q_values: got by averaging over num_atoms, Q=E[Z], shape [batch, num_acts]
+    self._q_argmax_eval = tf.argmax(self._net_outputs.q_values, axis=1)[0]
     if self.use_deep_exploration:
       if self.transform_strategy.endswith('STOCHASTIC'):
         q_transform = atari_helpers.random_stochastic_matrix(
@@ -171,14 +244,13 @@ class MultiNetworkDQNAgent(dqn_agent.DQNAgent):
             tf.random.uniform(
                 shape=(), maxval=self.num_networks, dtype=tf.int32))
         q_function = self._net_outputs.unordered_q_networks[
-            :, :, self._q_function_index]  # @Yi Random picked q_fn
+            :, :, self._q_function_index]
         # This is only used for picking an action
         self._q_argmax_train = tf.argmax(q_function, axis=1)[0]
     else:
       self._q_argmax_train = self._q_argmax_eval
 
   def _select_action(self):
-    """ select actions according to _q_argmax_eval/train"""
     if self.eval_mode:
       self._q_argmax = self._q_argmax_eval
     else:
@@ -186,6 +258,7 @@ class MultiNetworkDQNAgent(dqn_agent.DQNAgent):
     return super(MultiNetworkDQNAgent, self)._select_action()
 
   def _build_train_op(self):
+    # TODO: Chage the build train_op
     """Builds a training op.
 
     Returns:
@@ -197,7 +270,7 @@ class MultiNetworkDQNAgent(dqn_agent.DQNAgent):
         self._replay_net_outputs.q_networks, indices=indices)
     target = tf.stop_gradient(self._build_target_q_op())
     loss = tf.losses.huber_loss(
-        target, replay_chosen_q, reduction=tf.losses.Reduction.NONE) #@yi shape [batch, num_net]
+        target, replay_chosen_q, reduction=tf.losses.Reduction.NONE)
     q_head_losses = tf.reduce_mean(loss, axis=0)
     final_loss = tf.reduce_mean(q_head_losses)
     if self.summary_writer is not None:
